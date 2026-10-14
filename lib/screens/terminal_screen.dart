@@ -1,13 +1,10 @@
-﻿import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:dartssh2/dartssh2.dart';
 import 'package:xterm/xterm.dart';
-import '../models/ssh_host.dart';
+
 import '../providers/ssh_hosts_provider.dart';
+import '../providers/ssh_session_provider.dart';
 
 class ToolItem {
   final String name;
@@ -26,7 +23,8 @@ class ToolItem {
 const List<ToolItem> _opsTools = [
   ToolItem(
     name: '关闭屏幕',
-    command: 'sudo setterm -blank force -powersave powerdown > /dev/tty1 2>&1 && echo "屏幕已关闭"\n',
+    command:
+        'sudo setterm -blank force -powersave powerdown > /dev/tty1 2>&1 && echo "屏幕已关闭"\n',
     icon: Icons.brightness_low_outlined,
     description: '关闭笔记本屏幕',
   ),
@@ -71,116 +69,33 @@ class TerminalScreen extends ConsumerStatefulWidget {
 }
 
 class _TerminalScreenState extends ConsumerState<TerminalScreen> {
-  final terminal = Terminal(maxLines: 10000);
   final terminalController = TerminalController();
-  SSHClient? _client;
-  SSHSession? _session;
-  bool _isConnected = false;
-  bool _isConnecting = true;
-  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _connect();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _ensureConnected());
+  }
+
+  /// 复用共享会话：只有没连过才发起新连接
+  void _ensureConnected() {
+    if (!mounted) return;
+    final handle = ref.read(sshSessionProvider(widget.hostId));
+    if (handle.connected || handle.connecting) return;
+
+    final host =
+        ref.read(sshHostsProvider.notifier).getHostById(widget.hostId);
+    if (host == null) {
+      handle.terminal.write('主机不存在\r\n');
+      return;
+    }
+    handle.connect(host);
   }
 
   @override
   void dispose() {
-    _session?.close();
-    _client?.close();
+    // 故意不关闭 SSH 会话：Agent 可能正在用它，返回终端时也应该保持连接
     super.dispose();
-  }
-
-  Future<void> _connect() async {
-    final host =
-        ref.read(sshHostsProvider.notifier).getHostById(widget.hostId);
-    if (host == null) {
-      setState(() {
-        _error = '主机不存在';
-        _isConnecting = false;
-      });
-      return;
-    }
-
-    try {
-      terminal.write('正在连接 ${host.host}:${host.port}...\r\n');
-
-      final socket = await SSHSocket.connect(
-        host.host,
-        host.port,
-        timeout: const Duration(seconds: 15),
-      );
-
-      SSHClient client;
-      if (host.privateKey != null && host.privateKey!.isNotEmpty) {
-        // 密钥认证
-        final keyPairs = SSHKeyPair.fromPem(host.privateKey!);
-        client = SSHClient(
-          socket,
-          username: host.username,
-          identities: keyPairs,
-        );
-      } else {
-        // 密码认证
-        client = SSHClient(
-          socket,
-          username: host.username,
-          onPasswordRequest: () => host.password ?? '',
-        );
-      }
-
-      _client = client;
-      await client.authenticated;
-
-      setState(() {
-        _isConnected = true;
-        _isConnecting = false;
-      });
-      terminal.write('\r\n连接成功！\r\n\r\n');
-
-      final session = await client.shell(
-        pty: SSHPtyConfig(
-          type: 'xterm-256color',
-          width: 80,
-          height: 24,
-        ),
-      );
-
-      _session = session;
-
-      session.stdout.listen((data) {
-        terminal.write(utf8.decode(data));
-      });
-
-      session.stderr.listen((data) {
-        terminal.write(utf8.decode(data));
-      });
-
-      terminal.onOutput = (data) {
-        session.stdin.add(utf8.encode(data));
-      };
-
-      session.done.then((_) {
-        if (mounted) {
-          setState(() => _isConnected = false);
-          terminal.write('\r\n\r\n连接已断开\r\n');
-        }
-      });
-    } catch (e) {
-      setState(() {
-        _error = e.toString();
-        _isConnecting = false;
-      });
-      terminal.write('\r\n连接失败: $e\r\n');
-    }
-  }
-
-  void _runCommand(String command) {
-    if (_session != null && _isConnected) {
-      // 直接发送到 SSH 会话，同时在终端显示
-      _session!.stdin.add(utf8.encode(command));
-    }
   }
 
   void _showToolPanel() {
@@ -252,7 +167,9 @@ class _TerminalScreenState extends ConsumerState<TerminalScreen> {
                       child: InkWell(
                         borderRadius: BorderRadius.circular(16),
                         onTap: () {
-                          _runCommand(tool.command);
+                          ref
+                              .read(sshSessionProvider(widget.hostId))
+                              .sendRaw(tool.command);
                           Navigator.pop(context);
                         },
                         child: Padding(
@@ -309,17 +226,20 @@ class _TerminalScreenState extends ConsumerState<TerminalScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final handle = ref.watch(sshSessionProvider(widget.hostId));
     final host =
         ref.watch(sshHostsProvider.notifier).getHostById(widget.hostId);
     final colorScheme = Theme.of(context).colorScheme;
+
+    final isConnected = handle.connected;
+    final isConnecting = handle.connecting;
 
     return Scaffold(
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(host?.name ?? '终端',
-                style: const TextStyle(fontSize: 16)),
+            Text(host?.name ?? '终端', style: const TextStyle(fontSize: 16)),
             Row(
               children: [
                 Container(
@@ -327,16 +247,16 @@ class _TerminalScreenState extends ConsumerState<TerminalScreen> {
                   height: 8,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: _isConnected
+                    color: isConnected
                         ? Colors.green
-                        : (_isConnecting ? Colors.orange : Colors.red),
+                        : (isConnecting ? Colors.orange : Colors.red),
                   ),
                 ),
                 const SizedBox(width: 6),
                 Text(
-                  _isConnected
+                  isConnected
                       ? '已连接'
-                      : (_isConnecting ? '连接中...' : '已断开'),
+                      : (isConnecting ? '连接中...' : '已断开'),
                   style: TextStyle(
                     fontSize: 12,
                     color: colorScheme.onSurfaceVariant,
@@ -349,32 +269,28 @@ class _TerminalScreenState extends ConsumerState<TerminalScreen> {
         actions: [
           IconButton(
             icon: const Icon(Icons.analytics_outlined),
-            onPressed: _isConnected
+            onPressed: isConnected
                 ? () => context.push('/status/${widget.hostId}')
                 : null,
             tooltip: '系统状态',
           ),
           IconButton(
             icon: const Icon(Icons.handyman_outlined),
-            onPressed: _isConnected ? _showToolPanel : null,
+            onPressed: isConnected ? _showToolPanel : null,
             tooltip: '工具',
           ),
           IconButton(
             icon: const Icon(Icons.smart_toy_outlined),
-            onPressed: _isConnected
-                ? () => context.push('/ai/${widget.hostId}')
-                : null,
+            onPressed: () => context.push('/ai/${widget.hostId}'),
             tooltip: 'AI 助手',
           ),
           IconButton(
             icon: const Icon(Icons.refresh_outlined),
-            onPressed: () {
-              setState(() {
-                _isConnecting = true;
-                _error = null;
-              });
-              _connect();
-            },
+            onPressed: host == null
+                ? null
+                : () {
+                    ref.read(sshSessionProvider(widget.hostId)).reconnect(host);
+                  },
             tooltip: '重新连接',
           ),
         ],
@@ -382,7 +298,7 @@ class _TerminalScreenState extends ConsumerState<TerminalScreen> {
       body: Container(
         color: const Color(0xFF1E1E1E),
         child: TerminalView(
-          terminal,
+          handle.terminal,
           controller: terminalController,
           padding: const EdgeInsets.all(8),
         ),

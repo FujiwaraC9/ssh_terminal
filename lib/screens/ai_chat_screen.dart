@@ -1,18 +1,14 @@
-﻿import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
-import 'package:dartssh2/dartssh2.dart';
 import 'package:uuid/uuid.dart';
-import '../models/ai_config.dart';
 import '../models/chat_message.dart';
-import '../models/ssh_host.dart';
 import '../providers/ai_config_provider.dart';
 import '../providers/chat_provider.dart';
 import '../providers/ssh_hosts_provider.dart';
+import '../providers/ssh_session_provider.dart';
 import '../services/ai_service.dart';
 
 const _uuid = Uuid();
@@ -35,6 +31,12 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
   String? _conversationId;
   List<ChatMessage> _messages = [];
 
+  /// 已展开输出的执行卡片
+  final Set<String> _expandedExec = {};
+
+  /// 正在执行中的执行卡片
+  final Set<String> _runningExec = {};
+
   @override
   void initState() {
     super.initState();
@@ -45,7 +47,6 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
 
   void _loadConversation() {
     if (widget.conversationId != null) {
-      // 从历史记录打开
       final conv = ref
           .read(chatConversationsProvider.notifier)
           .getConversation(widget.conversationId!);
@@ -54,10 +55,10 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
           _conversationId = conv.id;
           _messages = List.from(conv.messages);
         });
+        _scrollToBottom();
         return;
       }
     }
-    // 新对话，先不创建，等第一条消息发送时再创建
     setState(() {
       _messages = [
         ChatMessage(
@@ -79,15 +80,64 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
     super.dispose();
   }
 
+  String _agentSystemPrompt() =>
+      '你是一个专业的 Linux 运维 AI 助手，可以直接帮用户操作服务器。\n\n'
+      '规则：\n'
+      '1. 当用户需要执行命令或排查问题时，用 ```shell\\n命令\\n``` 的格式输出要执行的命令\n'
+      '2. 每次只输出一条命令，执行完再根据结果决定下一步\n'
+      '3. 命令要简洁、安全，破坏性操作（如 rm、格式化等）要提醒用户确认\n'
+      '4. 用中文回答，先说明你要做什么，再给出命令\n'
+      '5. 对于简单问题可以直接回答，不需要都执行命令';
+
+  String _analysisSystemPrompt() =>
+      '你是一个专业的 Linux 运维 AI 助手。用户刚刚执行了一条命令，'
+      '请分析执行结果并用中文回答用户的问题。如果需要进一步操作，'
+      '可以继续用 ```shell\\n命令\\n``` 格式输出下一条命令。';
+
+  /// 把对话整理成发给模型的消息列表。
+  /// 执行卡片会被还原成「命令 + 执行结果」，让模型能拿到完整上下文。
+  List<Map<String, String>> _buildAiMessages(String systemPrompt) {
+    final list = <Map<String, String>>[
+      {'role': 'system', 'content': systemPrompt},
+    ];
+    for (final m in _messages) {
+      if (m.kind == 'exec') {
+        list.add({
+          'role': 'assistant',
+          'content': '```shell\n${m.command}\n```',
+        });
+        final out = m.output.trim();
+        list.add({
+          'role': 'user',
+          'content': '命令执行结果:\n\n${out.isEmpty ? '(无输出)' : out}',
+        });
+      } else {
+        if (m.content.trim().isEmpty) continue;
+        list.add({'role': m.role, 'content': m.content});
+      }
+    }
+    return list;
+  }
+
+  String? _ensureConversation() {
+    if (_conversationId != null) return _conversationId;
+    if (widget.hostId == null) return null;
+    final notifier = ref.read(chatConversationsProvider.notifier);
+    final conv = notifier.createConversation(widget.hostId!);
+    for (final m in _messages) {
+      notifier.addMessage(conv.id, m);
+    }
+    setState(() => _conversationId = conv.id);
+    return conv.id;
+  }
+
   Future<void> _sendMessage() async {
     final text = _messageController.text.trim();
     if (text.isEmpty || _isLoading) return;
 
     final aiConfig = ref.read(aiConfigProvider);
     if (aiConfig.apiKey.isEmpty || aiConfig.baseUrl.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先在设置中配置 API Key 和地址')),
-      );
+      _snack('请先在设置中配置 API Key 和地址');
       return;
     }
 
@@ -103,51 +153,21 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
       _isLoading = true;
       _messageController.clear();
     });
-
     _scrollToBottom();
 
-    // 如果是第一条用户消息，创建对话
-    if (_conversationId == null && widget.hostId != null) {
-      final conv = ref
-          .read(chatConversationsProvider.notifier)
-          .createConversation(widget.hostId!);
-      // 添加欢迎消息和用户消息
-      for (final m in _messages) {
-        ref
-            .read(chatConversationsProvider.notifier)
-            .addMessage(conv.id, m);
-      }
-      setState(() => _conversationId = conv.id);
-    } else if (_conversationId != null) {
-      ref
-          .read(chatConversationsProvider.notifier)
-          .addMessage(_conversationId!, userMsg);
+    final existedBefore = _conversationId != null;
+    final convId = _ensureConversation();
+    if (convId != null && existedBefore) {
+      ref.read(chatConversationsProvider.notifier).addMessage(convId, userMsg);
     }
 
-    try {
-      // 构建消息列表，加入 system prompt（Agent 模式）
-      final messagesList = <Map<String, String>>[];
-      if (widget.hostId != null) {
-        messagesList.add({
-          'role': 'system',
-          'content':
-              '你是一个专业的 Linux 运维 AI 助手，可以直接帮用户操作服务器。\n\n'
-                  '规则：\n'
-                  '1. 当用户需要执行命令或排查问题时，用 ```shell\\n命令\\n``` 的格式输出要执行的命令\n'
-                  '2. 每次只输出一条命令，执行完再根据结果决定下一步\n'
-                  '3. 命令要简洁、安全，破坏性操作（如 rm、格式化等）要提醒用户确认\n'
-                  '4. 用中文回答，先说明你要做什么，再给出命令\n'
-                  '5. 对于简单问题可以直接回答，不需要都执行命令'
-        });
-      } else {
-        messagesList.add({
-          'role': 'system',
-          'content': '你是一个 AI 助手，请用中文回答用户的问题。',
-        });
-      }
-      messagesList.addAll(
-          _messages.map((m) => {'role': m.role, 'content': m.content}));
+    final aiMessages = _buildAiMessages(
+      widget.hostId != null
+          ? _agentSystemPrompt()
+          : '你是一个 AI 助手，请用中文回答用户的问题。',
+    );
 
+    try {
       final assistantMsg = ChatMessage(
         id: _uuid.v4(),
         role: 'assistant',
@@ -155,31 +175,153 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
         timestamp: DateTime.now().millisecondsSinceEpoch,
       );
       setState(() => _messages.add(assistantMsg));
-
-      if (_conversationId != null) {
+      if (convId != null) {
         ref
             .read(chatConversationsProvider.notifier)
-            .addMessage(_conversationId!, assistantMsg);
+            .addMessage(convId, assistantMsg);
       }
 
       final response = await _aiService.chat(
         config: aiConfig,
-        messages: messagesList,
+        messages: aiMessages,
       );
 
+      if (!mounted) return;
       setState(() {
-        _messages.last.content = response;
+        assistantMsg.content = response;
         _isLoading = false;
       });
-
-      if (_conversationId != null) {
+      if (convId != null) {
         ref
             .read(chatConversationsProvider.notifier)
-            .replaceLastAssistantMessage(_conversationId!, response);
+            .replaceLastAssistantMessage(convId, response);
       }
-
       _scrollToBottom();
     } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _messages.add(ChatMessage(
+          id: _uuid.v4(),
+          role: 'assistant',
+          content: '出错了: $e',
+          timestamp: DateTime.now().millisecondsSinceEpoch,
+        ));
+        _isLoading = false;
+      });
+      _scrollToBottom();
+    }
+  }
+
+  /// 执行一条命令：复用终端那条共享 SSH 会话，实时显示输出，完成后自动折叠。
+  Future<void> _executeAndAnalyze(String command) async {
+    final hostId = widget.hostId;
+    if (hostId == null) return;
+
+    final handle = ref.read(sshSessionProvider(hostId));
+
+    // 从终端页进来时本来就连着；从底栏进来则先建立连接
+    if (!handle.connected && !handle.connecting) {
+      final host = ref.read(sshHostsProvider.notifier).getHostById(hostId);
+      if (host == null) {
+        _snack('找不到服务器配置');
+        return;
+      }
+      setState(() => _isLoading = true);
+      await handle.connect(host);
+      if (!mounted) return;
+    }
+
+    if (!handle.connected) {
+      setState(() => _isLoading = false);
+      _snack('SSH 未连接，请先回到终端页面连接服务器');
+      return;
+    }
+
+    final execMsg = ChatMessage(
+      id: _uuid.v4(),
+      role: 'assistant',
+      content: '',
+      kind: 'exec',
+      command: command,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+    );
+
+    setState(() {
+      _isLoading = true;
+      _messages.add(execMsg);
+      _expandedExec.add(execMsg.id);
+      _runningExec.add(execMsg.id);
+    });
+    _scrollToBottom();
+
+    final existedBefore = _conversationId != null;
+    final convId = _ensureConversation();
+    if (convId != null && existedBefore) {
+      ref.read(chatConversationsProvider.notifier).addMessage(convId, execMsg);
+    }
+
+    final output = await handle.runAgentCommand(
+      command,
+      onOutput: (partial) {
+        if (!mounted) return;
+        setState(() => execMsg.output = partial);
+        _scrollToBottom();
+      },
+    );
+
+    if (!mounted) return;
+    setState(() {
+      execMsg.output = output;
+      _runningExec.remove(execMsg.id);
+      // 执行完成自动折叠，需要时点开即可
+      _expandedExec.remove(execMsg.id);
+    });
+    if (convId != null) {
+      ref.read(chatConversationsProvider.notifier).persistConversation(convId);
+    }
+    _scrollToBottom();
+
+    await _analyzeResult();
+  }
+
+  /// 把执行结果交给 AI 继续分析
+  Future<void> _analyzeResult() async {
+    final aiConfig = ref.read(aiConfigProvider);
+    final convId = _conversationId;
+    final aiMessages = _buildAiMessages(_analysisSystemPrompt());
+
+    final analysisMsg = ChatMessage(
+      id: _uuid.v4(),
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+    );
+    setState(() => _messages.add(analysisMsg));
+    if (convId != null) {
+      ref
+          .read(chatConversationsProvider.notifier)
+          .addMessage(convId, analysisMsg);
+    }
+    _scrollToBottom();
+
+    try {
+      final response = await _aiService.chat(
+        config: aiConfig,
+        messages: aiMessages,
+      );
+      if (!mounted) return;
+      setState(() {
+        analysisMsg.content = response;
+        _isLoading = false;
+      });
+      if (convId != null) {
+        ref
+            .read(chatConversationsProvider.notifier)
+            .replaceLastAssistantMessage(convId, response);
+      }
+      _scrollToBottom();
+    } catch (e) {
+      if (!mounted) return;
       setState(() {
         _messages.add(ChatMessage(
           id: _uuid.v4(),
@@ -198,11 +340,17 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
       if (_scrollController.hasClients) {
         _scrollController.animateTo(
           _scrollController.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
+          duration: const Duration(milliseconds: 250),
           curve: Curves.easeOut,
         );
       }
     });
+  }
+
+  void _snack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   // 从 AI 回复中提取 shell 命令
@@ -220,153 +368,11 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
     return firstLine;
   }
 
-  // 执行命令并返回结果
-  Future<String> _executeCommand(String command) async {
-    if (widget.hostId == null) return '没有关联服务器';
-
-    final host = ref
-        .read(sshHostsProvider.notifier)
-        .getHostById(widget.hostId!);
-    if (host == null) return '找不到服务器配置';
-
-    try {
-      final socket = await SSHSocket.connect(
-        host.host,
-        host.port,
-        timeout: const Duration(seconds: 15),
-      );
-
-      SSHClient client;
-      if (host.privateKey != null && host.privateKey!.isNotEmpty) {
-        final keyPairs = SSHKeyPair.fromPem(host.privateKey!);
-        client = SSHClient(
-          socket,
-          username: host.username,
-          identities: keyPairs,
-        );
-      } else {
-        client = SSHClient(
-          socket,
-          username: host.username,
-          onPasswordRequest: () => host.password ?? '',
-        );
-      }
-
-      await client.authenticated;
-
-      final result = await client.run(command);
-      final output = utf8.decode(result);
-
-      client.close();
-      await client.done;
-
-      return output.isEmpty ? '(命令执行完成，无输出)' : output;
-    } catch (e) {
-      return '执行失败: $e';
-    }
-  }
-
-  // 执行命令并把结果发给 AI
-  Future<void> _executeAndAnalyze(String command) async {
-    setState(() => _isLoading = true);
-
-    // 添加命令执行的消息
-    final execMsg = ChatMessage(
-      id: _uuid.v4(),
-      role: 'assistant',
-      content: '🔧 正在执行命令: `$command`',
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    );
-    setState(() => _messages.add(execMsg));
-    _scrollToBottom();
-
-    if (_conversationId != null) {
-      ref
-          .read(chatConversationsProvider.notifier)
-          .addMessage(_conversationId!, execMsg);
-    }
-
-    // 执行命令
-    final result = await _executeCommand(command);
-
-    // 显示结果
-    final resultMsg = ChatMessage(
-      id: _uuid.v4(),
-      role: 'user',
-      content: '📋 命令执行结果:\n\n$result',
-      timestamp: DateTime.now().millisecondsSinceEpoch,
-    );
-    setState(() => _messages.add(resultMsg));
-    _scrollToBottom();
-
-    if (_conversationId != null) {
-      ref
-          .read(chatConversationsProvider.notifier)
-          .addMessage(_conversationId!, resultMsg);
-    }
-
-    // 让 AI 分析结果
-    final aiConfig = ref.read(aiConfigProvider);
-    try {
-      final messagesList = <Map<String, String>>[];
-      messagesList.add({
-        'role': 'system',
-        'content':
-            '你是一个专业的 Linux 运维 AI 助手。用户刚刚执行了一条命令，'
-                '请分析执行结果并用中文回答用户的问题。如果需要进一步操作，'
-                '可以继续用 ```shell\\n命令\\n``` 格式输出下一条命令。'
-      });
-      messagesList.addAll(
-          _messages.map((m) => {'role': m.role, 'content': m.content}));
-
-      final analysisMsg = ChatMessage(
-        id: _uuid.v4(),
-        role: 'assistant',
-        content: '',
-        timestamp: DateTime.now().millisecondsSinceEpoch,
-      );
-      setState(() => _messages.add(analysisMsg));
-
-      if (_conversationId != null) {
-        ref
-            .read(chatConversationsProvider.notifier)
-            .addMessage(_conversationId!, analysisMsg);
-      }
-
-      final response = await _aiService.chat(
-        config: aiConfig,
-        messages: messagesList,
-      );
-
-      setState(() {
-        _messages.last.content = response;
-        _isLoading = false;
-      });
-
-      if (_conversationId != null) {
-        ref
-            .read(chatConversationsProvider.notifier)
-            .replaceLastAssistantMessage(_conversationId!, response);
-      }
-
-      _scrollToBottom();
-    } catch (e) {
-      setState(() {
-        _messages.add(ChatMessage(
-          id: _uuid.v4(),
-          role: 'assistant',
-          content: '出错了: $e',
-          timestamp: DateTime.now().millisecondsSinceEpoch,
-        ));
-        _isLoading = false;
-      });
-      _scrollToBottom();
-    }
-  }
-
   void _newChat() {
     setState(() {
       _conversationId = null;
+      _expandedExec.clear();
+      _runningExec.clear();
       _messages = [
         ChatMessage(
           id: _uuid.v4(),
@@ -419,166 +425,28 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
                     itemCount: _messages.length,
                     itemBuilder: (context, index) {
                       final msg = _messages[index];
-                      final isUser = msg.role == 'user';
-                      return Padding(
-                        padding: const EdgeInsets.only(bottom: 12),
-                        child: Row(
-                          mainAxisAlignment: isUser
-                              ? MainAxisAlignment.end
-                              : MainAxisAlignment.start,
-                          children: [
-                            if (!isUser) ...[
+                      if (msg.kind == 'exec') {
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 12),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
                               CircleAvatar(
                                 radius: 16,
                                 backgroundColor: colorScheme.primary,
                                 child: Icon(
-                                  Icons.smart_toy_outlined,
+                                  Icons.terminal_outlined,
                                   size: 18,
                                   color: colorScheme.onPrimary,
                                 ),
                               ),
                               const SizedBox(width: 8),
+                              Flexible(child: _buildExecCard(context, msg)),
                             ],
-                            Flexible(
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 14, vertical: 10),
-                                decoration: BoxDecoration(
-                                  color: isUser
-                                      ? colorScheme.primary
-                                      : colorScheme.surfaceContainerHighest,
-                                  borderRadius: BorderRadius.circular(18),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    SelectionArea(
-                                      child: isUser
-                                          ? Text(
-                                              msg.content,
-                                              style: TextStyle(
-                                                color: colorScheme.onPrimary,
-                                              ),
-                                            )
-                                          : MarkdownBody(
-                                              data: msg.content.isEmpty &&
-                                                      index ==
-                                                          _messages.length - 1
-                                                  ? '_思考中..._'
-                                                  : msg.content,
-                                              selectable: false,
-                                              builders: {
-                                                'pre':
-                                                    _CodeblockBuilder(context),
-                                              },
-                                              styleSheet:
-                                                  MarkdownStyleSheet.fromTheme(
-                                                Theme.of(context),
-                                              ).copyWith(
-                                                p: TextStyle(
-                                                  color:
-                                                      colorScheme.onSurface,
-                                                  fontSize: 14,
-                                                ),
-                                                code: TextStyle(
-                                                  backgroundColor:
-                                                      colorScheme.surface,
-                                                  fontFamily: 'monospace',
-                                                  fontSize: 13,
-                                                ),
-                                              ),
-                                            ),
-                                    ),
-                                    // AI 消息且有 shell 命令时，显示执行按钮
-                                    if (!isUser &&
-                                        widget.hostId != null &&
-                                        _extractShellCommands(msg.content)
-                                            .isNotEmpty) ...[
-                                      const SizedBox(height: 12),
-                                      const Divider(height: 1),
-                                      const SizedBox(height: 10),
-                                      Row(
-                                        children: [
-                                          Icon(
-                                            Icons.terminal_outlined,
-                                            size: 16,
-                                            color: colorScheme.primary,
-                                          ),
-                                          const SizedBox(width: 6),
-                                          Text(
-                                            '检测到 ${_extractShellCommands(msg.content).length} 条命令',
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              fontWeight: FontWeight.w500,
-                                              color: colorScheme.primary,
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(height: 8),
-                                      ..._extractShellCommands(msg.content)
-                                          .asMap()
-                                          .entries
-                                          .map((entry) => Padding(
-                                                padding: const EdgeInsets.only(
-                                                    bottom: 8),
-                                                child:
-                                                    FilledButton.tonalIcon(
-                                                  onPressed: _isLoading
-                                                      ? null
-                                                      : () =>
-                                                          _executeAndAnalyze(
-                                                              entry.value),
-                                                  icon: const Icon(
-                                                      Icons.play_arrow,
-                                                      size: 18),
-                                                  label: Expanded(
-                                                    child: Text(
-                                                      _truncateCommand(
-                                                          entry.value),
-                                                      maxLines: 1,
-                                                      overflow:
-                                                          TextOverflow.ellipsis,
-                                                      style: const TextStyle(
-                                                          fontSize: 13),
-                                                    ),
-                                                  ),
-                                                  style: FilledButton
-                                                      .styleFrom(
-                                                    padding: const EdgeInsets
-                                                        .symmetric(
-                                                        horizontal: 12,
-                                                        vertical: 0),
-                                                    minimumSize:
-                                                        const Size(
-                                                            double.infinity,
-                                                            40),
-                                                    alignment:
-                                                        Alignment.centerLeft,
-                                                  ),
-                                                ),
-                                              ))
-                                          .toList(),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                            ),
-                            if (isUser) ...[
-                              const SizedBox(width: 8),
-                              CircleAvatar(
-                                radius: 16,
-                                backgroundColor: colorScheme.secondary,
-                                child: Icon(
-                                  Icons.person_outline,
-                                  size: 18,
-                                  color: colorScheme.onSecondary,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                      );
+                          ),
+                        );
+                      }
+                      return _buildTextMessage(context, msg, index);
                     },
                   ),
           ),
@@ -624,11 +492,320 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
     );
   }
 
+  /// 普通文本消息（用户气泡 / AI Markdown）
+  Widget _buildTextMessage(BuildContext context, ChatMessage msg, int index) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final isUser = msg.role == 'user';
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        mainAxisAlignment:
+            isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+        children: [
+          if (!isUser) ...[
+            CircleAvatar(
+              radius: 16,
+              backgroundColor: colorScheme.primary,
+              child: Icon(
+                Icons.smart_toy_outlined,
+                size: 18,
+                color: colorScheme.onPrimary,
+              ),
+            ),
+            const SizedBox(width: 8),
+          ],
+          Flexible(
+            child: Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: isUser
+                    ? colorScheme.primary
+                    : colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  SelectionArea(
+                    child: isUser
+                        ? Text(
+                            msg.content,
+                            style: TextStyle(
+                              color: colorScheme.onPrimary,
+                            ),
+                          )
+                        : MarkdownBody(
+                            data: msg.content.isEmpty &&
+                                    index == _messages.length - 1 &&
+                                    _isLoading
+                                ? '_思考中..._'
+                                : msg.content,
+                            selectable: false,
+                            builders: {
+                              'pre': _CodeblockBuilder(context),
+                            },
+                            styleSheet: _markdownStyleSheet(context),
+                          ),
+                  ),
+                  if (!isUser &&
+                      widget.hostId != null &&
+                      _extractShellCommands(msg.content).isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    const Divider(height: 1),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.terminal_outlined,
+                          size: 16,
+                          color: colorScheme.primary,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          '检测到 ${_extractShellCommands(msg.content).length} 条命令',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: colorScheme.primary,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    ..._extractShellCommands(msg.content)
+                        .asMap()
+                        .entries
+                        .map((entry) => Padding(
+                              padding: const EdgeInsets.only(bottom: 8),
+                              child: FilledButton.tonalIcon(
+                                onPressed: _isLoading
+                                    ? null
+                                    : () => _executeAndAnalyze(entry.value),
+                                icon: const Icon(Icons.play_arrow, size: 18),
+                                label: Expanded(
+                                  child: Text(
+                                    _truncateCommand(entry.value),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 13),
+                                  ),
+                                ),
+                                style: FilledButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 12, vertical: 0),
+                                  minimumSize:
+                                      const Size(double.infinity, 40),
+                                  alignment: Alignment.centerLeft,
+                                ),
+                              ),
+                            ))
+                        .toList(),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (isUser) ...[
+            const SizedBox(width: 8),
+            CircleAvatar(
+              radius: 16,
+              backgroundColor: colorScheme.secondary,
+              child: Icon(
+                Icons.person_outline,
+                size: 18,
+                color: colorScheme.onSecondary,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 命令执行卡片：折叠时只留一行标题，展开后显示命令和终端输出
+  Widget _buildExecCard(BuildContext context, ChatMessage msg) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final expanded = _expandedExec.contains(msg.id);
+    final running = _runningExec.contains(msg.id);
+
+    return Container(
+      decoration: BoxDecoration(
+        color: colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: colorScheme.outlineVariant),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          InkWell(
+            onTap: () {
+              setState(() {
+                if (expanded) {
+                  _expandedExec.remove(msg.id);
+                } else {
+                  _expandedExec.add(msg.id);
+                }
+              });
+            },
+            child: Padding(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.terminal_outlined,
+                    size: 16,
+                    color: colorScheme.primary,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '执行命令 · ${_truncateCommand(msg.command)}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  if (running)
+                    const SizedBox(
+                      width: 13,
+                      height: 13,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else
+                    const Icon(
+                      Icons.check_circle_outline,
+                      size: 14,
+                      color: Colors.green,
+                    ),
+                  Icon(
+                    expanded
+                        ? Icons.keyboard_arrow_up
+                        : Icons.keyboard_arrow_down,
+                    size: 20,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Container(
+              color: const Color(0xFF0E1116),
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          '\$ ${msg.command}',
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12.5,
+                            height: 1.4,
+                            color: Color(0xFF7EE787),
+                          ),
+                        ),
+                      ),
+                      InkWell(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: msg.output));
+                          _snack('已复制输出内容');
+                        },
+                        child: const Padding(
+                          padding: EdgeInsets.all(2),
+                          child: Icon(
+                            Icons.copy_all_outlined,
+                            size: 15,
+                            color: Color(0xFF8B949E),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Container(height: 1, color: const Color(0xFF30363D)),
+                  const SizedBox(height: 8),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 240),
+                    child: SingleChildScrollView(
+                      child: Text(
+                        msg.output.isEmpty
+                            ? (running ? '等待输出...' : '(无输出)')
+                            : msg.output,
+                        style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 12.5,
+                          height: 1.4,
+                          color: msg.output.isEmpty
+                              ? const Color(0xFF8B949E)
+                              : const Color(0xFFE6EDF3),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 明确指定各元素的颜色，避免 flutter_markdown 默认样式在深色模式下
+  /// 出现「浅色背景 + 浅色文字」的不可读组合（默认引用块背景是 Colors.blue.shade100）。
+  MarkdownStyleSheet _markdownStyleSheet(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
+      p: TextStyle(color: cs.onSurface, fontSize: 14, height: 1.5),
+      a: TextStyle(
+        color: cs.primary,
+        decoration: TextDecoration.underline,
+      ),
+      code: TextStyle(
+        backgroundColor: cs.surface,
+        color: cs.onSurface,
+        fontFamily: 'monospace',
+        fontSize: 13,
+      ),
+      blockquote: TextStyle(color: cs.onSurface, fontSize: 14, height: 1.5),
+      blockquotePadding: const EdgeInsets.all(12),
+      blockquoteDecoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(8),
+        border: Border(left: BorderSide(color: cs.primary, width: 3)),
+      ),
+      h1: TextStyle(color: cs.onSurface, fontSize: 22, fontWeight: FontWeight.bold),
+      h2: TextStyle(color: cs.onSurface, fontSize: 19, fontWeight: FontWeight.bold),
+      h3: TextStyle(color: cs.onSurface, fontSize: 17, fontWeight: FontWeight.w600),
+      h4: TextStyle(color: cs.onSurface, fontSize: 15, fontWeight: FontWeight.w600),
+      h5: TextStyle(color: cs.onSurface, fontSize: 14, fontWeight: FontWeight.w600),
+      h6: TextStyle(color: cs.onSurface, fontSize: 13, fontWeight: FontWeight.w600),
+      em: const TextStyle(fontStyle: FontStyle.italic),
+      strong: TextStyle(color: cs.onSurface, fontWeight: FontWeight.bold),
+      listBullet: TextStyle(color: cs.onSurface, fontSize: 14),
+      horizontalRuleDecoration: BoxDecoration(
+        border: Border(top: BorderSide(color: cs.outlineVariant)),
+      ),
+      tableBorder: TableBorder.all(color: cs.outlineVariant),
+      tableHead: TextStyle(color: cs.onSurface, fontWeight: FontWeight.w600),
+      tableBody: TextStyle(color: cs.onSurface, fontSize: 13),
+      tableCellsDecoration: BoxDecoration(color: cs.surfaceContainerHigh),
+    );
+  }
+
   void _showHistory() {
     if (widget.hostId == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先选择一台服务器')),
-      );
+      _snack('请先选择一台服务器');
       return;
     }
     final conversations = ref
@@ -731,7 +908,7 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
                                               conv.updatedAt)
                                           .toString()
                                           .substring(0, 16),
-                                      style: TextStyle(fontSize: 12),
+                                      style: const TextStyle(fontSize: 12),
                                     ),
                                     trailing: PopupMenuButton<String>(
                                       onSelected: (value) {
@@ -742,7 +919,6 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
                                                       .notifier)
                                               .deleteConversation(conv.id);
                                           setSheetState(() {});
-                                          // 如果正在看这个对话，新建一个
                                           if (_conversationId == conv.id) {
                                             _newChat();
                                           }
@@ -768,6 +944,8 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
                                       Navigator.pop(context);
                                       setState(() {
                                         _conversationId = conv.id;
+                                        _expandedExec.clear();
+                                        _runningExec.clear();
                                         _messages =
                                             List.from(conv.messages);
                                       });
@@ -804,9 +982,7 @@ class _CodeblockBuilder extends MarkdownElementBuilder {
     TextStyle? preferredStyle,
     TextStyle? parentStyle,
   ) {
-    // pre 元素下面有一个 code 子元素
     final text = element.textContent ?? '';
-    // 从 code 的 class 属性提取语言，如 "language-shell"
     String? language;
     final children = element.children ?? [];
     if (children.isNotEmpty) {
@@ -835,8 +1011,7 @@ class _CodeblockBuilder extends MarkdownElementBuilder {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Container(
-            padding: const EdgeInsets.symmetric(
-                horizontal: 12, vertical: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
             decoration: BoxDecoration(
               color: colorScheme.surfaceContainerHighest,
               borderRadius: const BorderRadius.only(
@@ -863,8 +1038,7 @@ class _CodeblockBuilder extends MarkdownElementBuilder {
                 const Spacer(),
                 InkWell(
                   onTap: () {
-                    Clipboard.setData(
-                        ClipboardData(text: text));
+                    Clipboard.setData(ClipboardData(text: text));
                     ScaffoldMessenger.of(ctx).showSnackBar(
                       const SnackBar(
                         content: Text('已复制到剪贴板'),

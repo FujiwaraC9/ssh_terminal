@@ -16,11 +16,26 @@ class ChatMessage extends HiveObject {
   @HiveField(3)
   final int timestamp;
 
+  /// 消息类型：'text' 普通消息，'exec' 命令执行卡片
+  @HiveField(4)
+  final String kind;
+
+  /// kind == 'exec' 时执行的命令
+  @HiveField(5)
+  final String command;
+
+  /// kind == 'exec' 时的终端输出（执行过程中会被实时刷新）
+  @HiveField(6)
+  String output;
+
   ChatMessage({
     required this.id,
     required this.role,
     required this.content,
     required this.timestamp,
+    this.kind = 'text',
+    this.command = '',
+    this.output = '',
   });
 }
 

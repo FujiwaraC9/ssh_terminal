@@ -74,6 +74,15 @@ class ChatConversationsNotifier
     }
   }
 
+  /// 把对话内已变更的消息（例如执行卡片的输出）落盘
+  void persistConversation(String conversationId) {
+    final conv = _box.get(conversationId);
+    if (conv == null) return;
+    conv.updatedAt = DateTime.now().millisecondsSinceEpoch;
+    conv.save();
+    _loadAll();
+  }
+
   void deleteConversation(String conversationId) {
     _box.delete(conversationId);
     state = state.where((c) => c.id != conversationId).toList();

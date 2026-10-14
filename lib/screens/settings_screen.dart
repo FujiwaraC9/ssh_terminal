@@ -1,11 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:url_launcher/url_launcher.dart';
 import '../app_version.dart';
 import '../models/ai_config.dart';
 import '../providers/ai_config_provider.dart';
 import '../providers/theme_provider.dart';
 import '../services/ai_service.dart';
+import '../services/apk_installer.dart';
 import '../services/update_service.dart';
 
 class SettingsScreen extends ConsumerStatefulWidget {
@@ -402,15 +403,9 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           ),
           FilledButton(
             onPressed: update.downloadUrl != null
-                ? () async {
-                    final uri = Uri.parse(update.downloadUrl!);
-                    if (await canLaunchUrl(uri)) {
-                      await launchUrl(
-                        uri,
-                        mode: LaunchMode.externalApplication,
-                      );
-                    }
-                    if (ctx.mounted) Navigator.of(ctx).pop();
+                ? () {
+                    Navigator.of(ctx).pop();
+                    _downloadAndInstall(update);
                   }
                 : null,
             child: const Text('下载更新'),
@@ -418,5 +413,62 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
         ],
       ),
     );
+  }
+
+  /// 应用内下载 APK 并调起系统安装器，不再跳浏览器
+  Future<void> _downloadAndInstall(AppUpdateInfo update) async {
+    final url = update.downloadUrl;
+    if (url == null) return;
+
+    final progress = ValueNotifier<double>(0);
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('正在下载更新'),
+        content: ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (context, value, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              LinearProgressIndicator(value: value <= 0 ? null : value),
+              const SizedBox(height: 12),
+              Text(
+                value <= 0
+                    ? '正在连接...'
+                    : '已下载 ${(value * 100).toStringAsFixed(0)}%',
+                style: const TextStyle(fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+
+    try {
+      final file = await ApkInstaller.downloadApk(
+        url,
+        fileName: 'ssh_terminal_update.apk',
+        onProgress: (received, total) {
+          if (total > 0) progress.value = received / total;
+        },
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      await ApkInstaller.install(file);
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      _showMessage(
+        '安装失败',
+        '${e.message ?? '未知错误'}\n\n如果系统提示未授权，请在「设置 - 安装未知应用」中允许本应用后重试。',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      _showMessage('下载失败', '$e');
+    } finally {
+      progress.dispose();
+    }
   }
 }
