@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:url_launcher/url_launcher.dart';
+import '../app_version.dart';
 import '../models/ai_config.dart';
 import '../providers/ai_config_provider.dart';
 import '../providers/theme_provider.dart';
@@ -267,9 +268,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           const SizedBox(height: 12),
           Card(
             child: ListTile(
-              leading: const Icon(Icons.info_outline),
+              leading: const Icon(Icons.system_update_alt_outlined),
               title: const Text('版本'),
-              trailing: const Text('2.5.0'),
+              subtitle: const Text('点击检查更新'),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('v$kAppVersion'),
+                  const SizedBox(width: 2),
+                  const Icon(Icons.chevron_right, size: 20),
+                ],
+              ),
               onTap: _checkForUpdate,
             ),
           ),
@@ -302,7 +311,6 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 
   Future<void> _checkForUpdate() async {
-    const currentVersion = '2.5.0';
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -318,76 +326,97 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       ),
     );
 
-    final update = await UpdateService.checkUpdate(currentVersion);
+    final result = await UpdateService.checkUpdate(kAppVersion);
     if (mounted) Navigator.of(context).pop();
-
     if (!mounted) return;
 
-    if (update == null) {
-      showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('已是最新版本'),
-          content: Text('当前版本 v$currentVersion'),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('好的'),
-            ),
-          ],
-        ),
-      );
-    } else {
-      showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: Text('发现新版本 v${update.version}'),
-          content: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (update.releaseNotes != null &&
-                    update.releaseNotes!.isNotEmpty)
-                  Text(
-                    update.releaseNotes!,
-                    style: const TextStyle(fontSize: 14),
-                  ),
-                const SizedBox(height: 12),
-                if (update.apkName != null)
-                  Text(
-                    '文件: ${update.apkName}',
-                    style: TextStyle(
-                      fontSize: 12,
-                      color: Theme.of(context).colorScheme.outline,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(ctx).pop(),
-              child: const Text('稍后再说'),
-            ),
-            FilledButton(
-              onPressed: update.downloadUrl != null
-                  ? () async {
-                      final uri = Uri.parse(update.downloadUrl!);
-                      if (await canLaunchUrl(uri)) {
-                        await launchUrl(
-                          uri,
-                          mode: LaunchMode.externalApplication,
-                        );
-                      }
-                      if (ctx.mounted) Navigator.of(ctx).pop();
-                    }
-                  : null,
-              child: const Text('下载更新'),
-            ),
-          ],
-        ),
-      );
+    switch (result.status) {
+      case UpdateStatus.upToDate:
+        _showMessage('已是最新版本', '当前版本 v$kAppVersion');
+        break;
+      case UpdateStatus.failed:
+        _showMessage('检查更新失败', result.error ?? '未知错误');
+        break;
+      case UpdateStatus.hasUpdate:
+        _showUpdateDialog(result.info!);
+        break;
     }
+  }
+
+  void _showMessage(String title, String message) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('好的'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showUpdateDialog(AppUpdateInfo update) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('发现新版本 v${update.version}'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '当前版本 v$kAppVersion',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Theme.of(ctx).colorScheme.outline,
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (update.releaseNotes != null &&
+                  update.releaseNotes!.isNotEmpty)
+                Text(
+                  update.releaseNotes!,
+                  style: const TextStyle(fontSize: 14),
+                ),
+              const SizedBox(height: 12),
+              if (update.apkName != null)
+                Text(
+                  '文件: ${update.apkName}',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: Theme.of(ctx).colorScheme.outline,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('稍后再说'),
+          ),
+          FilledButton(
+            onPressed: update.downloadUrl != null
+                ? () async {
+                    final uri = Uri.parse(update.downloadUrl!);
+                    if (await canLaunchUrl(uri)) {
+                      await launchUrl(
+                        uri,
+                        mode: LaunchMode.externalApplication,
+                      );
+                    }
+                    if (ctx.mounted) Navigator.of(ctx).pop();
+                  }
+                : null,
+            child: const Text('下载更新'),
+          ),
+        ],
+      ),
+    );
   }
 }
