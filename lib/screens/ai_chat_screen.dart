@@ -80,19 +80,47 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
     super.dispose();
   }
 
-  String _agentSystemPrompt() =>
-      '你是一个专业的 Linux 运维 AI 助手，可以直接帮用户操作服务器。\n\n'
-      '规则：\n'
-      '1. 当用户需要执行命令或排查问题时，用 ```shell\\n命令\\n``` 的格式输出要执行的命令\n'
-      '2. 每次只输出一条命令，执行完再根据结果决定下一步\n'
-      '3. 命令要简洁、安全，破坏性操作（如 rm、格式化等）要提醒用户确认\n'
-      '4. 用中文回答，先说明你要做什么，再给出命令\n'
-      '5. 对于简单问题可以直接回答，不需要都执行命令';
+  /// 身份 + 运行环境。Agent 必须清楚自己是谁、命令在哪儿执行，
+  /// 否则会反问用户「你在哪个终端里执行这条命令」。
+  String _agentIdentity() {
+    var target = '一台远程 Linux 服务器';
+    final hostId = widget.hostId;
+    if (hostId != null) {
+      final host = ref.read(sshHostsProvider.notifier).getHostById(hostId);
+      if (host != null) {
+        target = '远程 Linux 服务器 ${host.username}@${host.host}:${host.port}';
+        if (host.name.isNotEmpty) {
+          target = '$target（服务器名称：${host.name}）';
+        }
+      }
+    }
+    return '你是「SSH 终端」这款 App 内置的运维 AI 助手。\n\n'
+        '【运行环境】\n'
+        '- 你面对的是用户通过本 App 用 SSH 连接的 $target。\n'
+        '- 命令由 App 代你在这台服务器上执行：走 App 内置终端的那条 SSH 连接，'
+        '用户点「执行」按钮后就会真正运行，执行结果会回传给你。\n'
+        '- 你访问不到用户手机本地的环境，也不需要知道「在哪个终端执行」——'
+        '答案永远是「本 App 内置的 SSH 终端，连的就是上面这台服务器」。'
+        '所以不要反问用户用的是桌面终端、串口还是虚拟机控制台。\n';
+  }
 
-  String _analysisSystemPrompt() =>
-      '你是一个专业的 Linux 运维 AI 助手。用户刚刚执行了一条命令，'
-      '请分析执行结果并用中文回答用户的问题。如果需要进一步操作，'
-      '可以继续用 ```shell\\n命令\\n``` 格式输出下一条命令。';
+  String _systemPrompt({required bool analyzing}) {
+    final identity = _agentIdentity();
+    if (analyzing) {
+      return '$identity\n'
+          '【当前任务】\n'
+          '用户刚执行了一条命令，执行结果已经给出。请用中文简要解读结果，'
+          '并说明下一步该做什么。如果还需要继续执行命令，'
+          '用 ```shell\\n命令\\n``` 格式给出下一条命令（一次只给一条）。';
+    }
+    return '$identity\n'
+        '【工作方式】\n'
+        '1. 需要执行命令或排查问题时，用 ```shell\\n命令\\n``` 格式输出，一次只给一条命令。\n'
+        '2. 命令要简洁、可直接执行；破坏性操作（rm -rf、格式化、dd、重启服务等）先提醒风险。\n'
+        '3. 用中文回答，先一句话说明你要做什么，再给出命令。\n'
+        '4. 简单问题直接回答即可，不必都去执行命令。\n'
+        '5. 拿到执行结果后，简要解读并给出下一步建议。';
+  }
 
   /// 把对话整理成发给模型的消息列表。
   /// 执行卡片会被还原成「命令 + 执行结果」，让模型能拿到完整上下文。
@@ -163,7 +191,7 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
 
     final aiMessages = _buildAiMessages(
       widget.hostId != null
-          ? _agentSystemPrompt()
+          ? _systemPrompt(analyzing: false)
           : '你是一个 AI 助手，请用中文回答用户的问题。',
     );
 
@@ -288,7 +316,7 @@ class _AiChatScreenState extends ConsumerState<AiChatScreen> {
   Future<void> _analyzeResult() async {
     final aiConfig = ref.read(aiConfigProvider);
     final convId = _conversationId;
-    final aiMessages = _buildAiMessages(_analysisSystemPrompt());
+    final aiMessages = _buildAiMessages(_systemPrompt(analyzing: true));
 
     final analysisMsg = ChatMessage(
       id: _uuid.v4(),

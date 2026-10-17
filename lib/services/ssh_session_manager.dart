@@ -11,7 +11,7 @@ import '../models/ssh_host.dart';
 ///
 /// 终端界面和 AI Agent 都复用同一个句柄，所以：
 /// - 从终端进 Agent 再返回，连接不会断
-/// - Agent 执行的命令走的就是同一个终端，回终端能看见
+/// - Agent 执行的命令与输出会镜像到同一个终端缓冲区，回终端能看见
 class SshSessionHandle extends ChangeNotifier {
   SshSessionHandle(this.hostId);
 
@@ -26,13 +26,6 @@ class SshSessionHandle extends ChangeNotifier {
   bool connected = false;
   bool connecting = false;
   String? error;
-
-  /// 原始输出字节流，供 Agent 捕获命令结果
-  final StreamController<List<int>> _rawOutput =
-      StreamController<List<int>>.broadcast();
-  Stream<List<int>> get rawOutput => _rawOutput.stream;
-
-  bool get isUsable => _session != null && connected;
 
   Future<void> connect(SshHost host) async {
     if (connecting || connected) return;
@@ -74,12 +67,10 @@ class SshSessionHandle extends ChangeNotifier {
 
       session.stdout.listen((data) {
         terminal.write(utf8.decode(data, allowMalformed: true));
-        if (!_rawOutput.isClosed) _rawOutput.add(data);
       });
 
       session.stderr.listen((data) {
         terminal.write(utf8.decode(data, allowMalformed: true));
-        if (!_rawOutput.isClosed) _rawOutput.add(data);
       });
 
       terminal.onOutput = (data) {
@@ -116,91 +107,112 @@ class SshSessionHandle extends ChangeNotifier {
     await connect(host);
   }
 
-  /// 直接把命令打进交互式终端（工具面板用）
+  /// 直接把命令打进交互式终端（工具面板用）。
+  /// 统一用 \r 收尾，等价于用户按回车，兼容性最好。
   void sendRaw(String command) {
     final session = _session;
     if (session == null || !connected) return;
-    session.stdin.add(utf8.encode(command));
+    session.stdin.add(utf8.encode('${_normalize(command)}\r'));
   }
 
-  /// Agent 执行命令：走同一条终端会话，实时回报输出，命令结束才返回。
+  /// Agent 执行命令：在共享的 SSH 连接上开一条独立的 exec 通道运行，
+  /// 并把「命令 + 实时输出 + 结束标记」镜像写进终端缓冲区。
   ///
-  /// 结束判定靠一条哨兵 echo，避免依赖提示符格式。
+  /// 之所以不用交互式 shell 的 stdin：那条 shell 可能正处在密码提示、
+  /// 前台进程或未闭合引号等状态，命令会被吞掉导致完全没有输出。
   Future<String> runAgentCommand(
     String command, {
     Duration timeout = const Duration(minutes: 5),
     void Function(String partial)? onOutput,
   }) async {
-    final session = _session;
-    if (session == null || !connected) {
-      return '(当前没有可用的 SSH 连接，请先回到终端页面连接)';
+    final client = _client;
+    final cmd = command.trim();
+    if (client == null || cmd.isEmpty) {
+      return '(当前没有可用的 SSH 连接，请先回到终端页面连接服务器)';
     }
 
-    final marker = '__TRAE_DONE_${DateTime.now().microsecondsSinceEpoch}__';
-    final buffer = <int>[];
-    final done = Completer<void>();
-    var lastEmit = 0;
-
+    // 显式写进终端，保证回到终端一定能看到 Agent 执行了什么
     terminal.write('\r\n\x1b[36m── AI 执行命令 ──\x1b[0m\r\n');
+    terminal.write('\x1b[32m\$ $cmd\x1b[0m\r\n');
 
-    final sub = rawOutput.listen((data) {
+    final buffer = <int>[];
+
+    SSHSession session;
+    try {
+      session = await client.execute(cmd);
+    } catch (e) {
+      terminal.write('\x1b[31m执行失败: $e\x1b[0m\r\n');
+      return '执行失败: $e';
+    }
+
+    void sink(List<int> data) {
       buffer.addAll(data);
-      final text = utf8.decode(buffer, allowMalformed: true);
+      final text = utf8.decode(data, allowMalformed: true);
+      // exec 通道没有 PTY，输出只有 \n，补成 \r\n 终端才不会错行
+      terminal.write(text.replaceAll('\r\n', '\n').replaceAll('\n', '\r\n'));
+    }
 
-      if (onOutput != null) {
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - lastEmit > 150) {
-          lastEmit = now;
-          onOutput(_partialView(text, marker));
-        }
-      }
+    // session.done 只代表通道关闭，此时 stdout/stderr 可能还有数据没投递完，
+    // 所以必须等两个流都收尾再取结果，否则会拿到空输出。
+    final stdoutDone = Completer<void>();
+    final stderrDone = Completer<void>();
+    session.stdout.listen(
+      sink,
+      onDone: () => stdoutDone.complete(),
+      onError: (Object _) => stdoutDone.complete(),
+    );
+    session.stderr.listen(
+      sink,
+      onDone: () => stderrDone.complete(),
+      onError: (Object _) => stderrDone.complete(),
+    );
 
-      if (!done.isCompleted && text.contains(marker)) {
-        done.complete();
-      }
+    var lastLen = 0;
+    final ticker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (onOutput == null || buffer.length == lastLen) return;
+      lastLen = buffer.length;
+      onOutput(_preview(utf8.decode(buffer, allowMalformed: true)));
     });
 
-    session.stdin.add(utf8.encode('$command\n'));
-    session.stdin.add(utf8.encode('echo "$marker"\n'));
-
     try {
-      await done.future.timeout(timeout);
+      await Future.wait([
+        session.done,
+        stdoutDone.future,
+        stderrDone.future,
+      ]).timeout(timeout);
     } on TimeoutException {
-      // 命令长时间没结束，返回已经捕获到的内容
+      session.close();
     } finally {
-      await sub.cancel();
+      ticker.cancel();
     }
 
-    return _clean(utf8.decode(buffer, allowMalformed: true), command, marker);
+    terminal.write('\x1b[36m── 执行结束 ──\x1b[0m\r\n');
+
+    final text = _clean(utf8.decode(buffer, allowMalformed: true));
+    return text.isEmpty ? '(命令执行完成，无输出)' : text;
   }
 
-  /// 实时预览：只保留尾部，避免大输出时反复处理整段文本
-  String _partialView(String text, String marker) {
-    var t = _stripAnsi(text);
-    final lines = t.split(RegExp(r'\r?\n'));
-    t = lines.where((l) => !l.contains(marker)).join('\n');
+  String _normalize(String command) {
+    var cmd = command.replaceAll('\r', '');
+    if (cmd.endsWith('\n')) cmd = cmd.substring(0, cmd.length - 1);
+    return cmd;
+  }
+
+  /// 实时预览：去掉 ANSI，只保留尾部
+  String _preview(String raw) {
+    var text = _clean(raw);
     const limit = 4000;
-    if (t.length > limit) {
-      t = '...(仅显示最新输出)\n${t.substring(t.length - limit)}';
+    if (text.length > limit) {
+      text = '...(仅显示最新输出)\n${text.substring(text.length - limit)}';
     }
-    return t;
+    return text;
   }
 
-  String _clean(String raw, String command, String marker) {
-    var text = _stripAnsi(raw);
-
-    // 去掉含哨兵的行（echo 命令行 + 哨兵输出行）
-    final lines = text.split(RegExp(r'\r?\n'));
-    text = lines.where((l) => !l.contains(marker)).join('\n');
-
-    // 去掉命令本身的回显（只处理开头附近，避免误删输出里的同名文本）
-    final idx = text.indexOf(command);
-    if (idx >= 0 && idx < 400) {
-      text = text.replaceRange(idx, idx + command.length, '');
-    }
-
-    text = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-    return text.trim();
+  String _clean(String raw) {
+    return _stripAnsi(raw)
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .trim();
   }
 
   String _stripAnsi(String input) {
@@ -213,7 +225,6 @@ class SshSessionHandle extends ChangeNotifier {
   void dispose() {
     _session?.close();
     _client?.close();
-    if (!_rawOutput.isClosed) _rawOutput.close();
     super.dispose();
   }
 }
